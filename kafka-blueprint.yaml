@@ -1,0 +1,164 @@
+# Kasten Blueprint - Apache Kafka KRaft (chart/kafka-kraft, combined broker + controller StatefulSet)
+# Pattern: "Quiesce" by scale-down. Every node is stopped cleanly before Veeam Kasten snapshots
+# the PVCs, so all brokers are captured at the same point, with closed segments and no recovery
+# needed at restart. Kasten remains the data mover (PVC snapshot + export).
+#
+# The original replica count is kept in the StatefulSet annotation kasten-kafka/original-replicas:
+# backupPosthook and restorePosthook scale back to it.
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: kafka-bp
+  namespace: kasten-io
+actions:
+  backupPrehook:
+    phases:
+      - func: KubeTask
+        name: stopKafka
+        args:
+          # kasten-io + kanister-svc service account: RBAC to annotate and scale the StatefulSet
+          namespace: kasten-io
+          image: docker.io/bitnami/kubectl:latest
+          podOverride:
+            serviceAccountName: kanister-svc
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              NS="{{ .StatefulSet.Namespace }}"
+              STS="{{ .StatefulSet.Name }}"
+              ANN="kasten-kafka/original-replicas"
+
+              current=$(kubectl get statefulset -n "$NS" "$STS" -o jsonpath='{.spec.replicas}')
+              if [ "$current" -gt 0 ]; then
+                kubectl annotate statefulset -n "$NS" "$STS" "$ANN=$current" --overwrite
+              fi
+              # Already at 0 (retry after a failed run): keep the count saved by the first attempt
+              replicas=$(kubectl get statefulset -n "$NS" "$STS" -o jsonpath="{.metadata.annotations['kasten-kafka/original-replicas']}")
+              [ -n "$replicas" ] && [ "$replicas" -gt 0 ] || { echo "No replica count saved in $ANN"; exit 1; }
+
+              echo "Stopping $replicas Kafka nodes"
+              kubectl scale statefulset -n "$NS" "$STS" --replicas=0
+              for i in $(seq 0 $((replicas - 1))); do
+                kubectl wait --for=delete "pod/$STS-$i" -n "$NS" --timeout=600s
+              done
+              echo "Kafka stopped, PVCs ready for snapshot"
+
+  backupPosthook:
+    phases:
+      - func: KubeTask
+        name: startKafka
+        args:
+          namespace: kasten-io
+          image: docker.io/bitnami/kubectl:latest
+          podOverride:
+            serviceAccountName: kanister-svc
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              NS="{{ .StatefulSet.Namespace }}"
+              STS="{{ .StatefulSet.Name }}"
+              replicas=$(kubectl get statefulset -n "$NS" "$STS" -o jsonpath="{.metadata.annotations['kasten-kafka/original-replicas']}")
+              [ -n "$replicas" ] && [ "$replicas" -gt 0 ] || { echo "No replica count saved in kasten-kafka/original-replicas"; exit 1; }
+
+              echo "Starting $replicas Kafka nodes"
+              kubectl scale statefulset -n "$NS" "$STS" --replicas="$replicas"
+              kubectl rollout status statefulset -n "$NS" "$STS" --timeout=900s
+
+  restorePosthook:
+    phases:
+      # The restored StatefulSet spec may carry replicas=0 (captured while Kafka was stopped)
+      - func: KubeTask
+        name: startKafka
+        args:
+          namespace: kasten-io
+          image: docker.io/bitnami/kubectl:latest
+          podOverride:
+            serviceAccountName: kanister-svc
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              NS="{{ .StatefulSet.Namespace }}"
+              STS="{{ .StatefulSet.Name }}"
+              replicas=$(kubectl get statefulset -n "$NS" "$STS" -o jsonpath="{.metadata.annotations['kasten-kafka/original-replicas']}")
+              current=$(kubectl get statefulset -n "$NS" "$STS" -o jsonpath='{.spec.replicas}')
+              if [ -n "$replicas" ] && [ "$current" != "$replicas" ]; then
+                echo "Scaling Kafka from $current to $replicas nodes"
+                kubectl scale statefulset -n "$NS" "$STS" --replicas="$replicas"
+              fi
+              kubectl rollout status statefulset -n "$NS" "$STS" --timeout=900s
+
+      - func: KubeExec
+        name: checkKafka
+        args:
+          namespace: "{{ .StatefulSet.Namespace }}"
+          pod: "{{ .StatefulSet.Name }}-0"
+          container: kafka
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              export KAFKA_HEAP_OPTS="-Xmx256m"
+              BIN=/opt/kafka/bin
+              BS=localhost:9092
+              expected=$(echo "$KAFKA_CONTROLLER_QUORUM_VOTERS" | tr ',' '\n' | grep -c '@')
+
+              i=0
+              until [ "$($BIN/kafka-broker-api-versions.sh --bootstrap-server $BS 2>/dev/null | grep -c '(id:' || true)" = "$expected" ]; do
+                i=$((i+1)); [ "$i" -ge 60 ] && { echo "Only some of the $expected brokers registered"; exit 1; }
+                sleep 5
+              done
+              i=0
+              until [ "$($BIN/kafka-topics.sh --bootstrap-server $BS --describe --under-replicated-partitions | grep -c 'Partition:' || true)" = "0" ]; do
+                i=$((i+1)); [ "$i" -ge 60 ] && { echo "Partitions still under-replicated"; exit 1; }
+                sleep 5
+              done
+
+              echo "Kafka restored - $expected brokers, no under-replicated partitions"
+              echo "Messages per topic:"
+              $BIN/kafka-get-offsets.sh --bootstrap-server $BS 2>/dev/null \
+                | awk -F: '$1 !~ /^__/ { s[$1] += $3 } END { for (t in s) print "  " t ": " s[t] }'
+---
+# Auto-attach to the chart/kafka-kraft StatefulSets, unless one is already annotated
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: kafka-bp-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: kafka-bp
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: statefulsets
+      - labels:
+          key: app.kubernetes.io/name
+          operator: In
+          values:
+            - kafka-kraft
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist

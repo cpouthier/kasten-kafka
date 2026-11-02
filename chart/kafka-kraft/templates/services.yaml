@@ -1,0 +1,32 @@
+# Headless service: stable DNS per node. publishNotReadyAddresses lets the
+# controllers resolve each other before they are ready, so the quorum can form.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kafka-kraft.headless" . }}
+  labels:
+    {{- include "kafka-kraft.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "kafka-kraft.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: client
+      port: 9092
+    - name: controller
+      port: 9093
+---
+# Client bootstrap service
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    {{- include "kafka-kraft.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "kafka-kraft.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: client
+      port: 9092

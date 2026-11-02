@@ -1,0 +1,31 @@
+image:
+  repository: docker.io/apache/kafka
+  tag: "4.2.0"
+  pullPolicy: IfNotPresent
+
+# Number of combined broker + controller nodes. The KRaft voter list is built from
+# this value, so change it with helm upgrade, not with kubectl scale.
+replicaCount: 3
+
+# KRaft cluster ID (22 characters, base64 UUID). Generate one with:
+#   docker run --rm docker.io/apache/kafka:4.2.0 /opt/kafka/bin/kafka-storage.sh random-uuid
+clusterId: "MkU3OEVBNTcwNTJENDM2Qk"
+
+clusterDomain: cluster.local
+
+# Default partition count for auto-created topics
+numPartitions: 3
+
+persistence:
+  # Use a CSI StorageClass with VolumeSnapshot support
+  storageClass: ""
+  size: 2Gi
+
+heapOpts: "-Xms512m -Xmx512m"
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 768Mi
+  limits:
+    memory: 1536Mi

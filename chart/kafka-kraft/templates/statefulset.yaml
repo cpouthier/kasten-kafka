@@ -1,0 +1,108 @@
+{{- $headless := include "kafka-kraft.headless" . -}}
+{{- $replicas := int .Values.replicaCount -}}
+{{- $rf := min 3 $replicas -}}
+{{- $minIsr := max 1 (sub $rf 1) -}}
+{{- $voters := list -}}
+{{- range $i := until $replicas -}}
+{{- $voters = append $voters (printf "%d@%s-%d.%s.%s.svc.%s:9093" $i $.Release.Name $i $headless $.Release.Namespace $.Values.clusterDomain) -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    {{- include "kafka-kraft.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $replicas }}
+  serviceName: {{ $headless }}
+  # All nodes start together, a KRaft quorum needs a majority of voters up
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "kafka-kraft.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kafka-kraft.labels" . | nindent 8 }}
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        runAsNonRoot: true
+      # Leave time for a clean shutdown (log flush, controlled leadership transfer)
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: kafka
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - bash
+            - -c
+            - |
+              # Node ID = StatefulSet ordinal
+              export KAFKA_NODE_ID="${HOSTNAME##*-}"
+              export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${HOSTNAME}.{{ $headless }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:9092"
+              exec /etc/kafka/docker/run
+          env:
+            - name: CLUSTER_ID
+              value: {{ .Values.clusterId | quote }}
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: {{ join "," $voters | quote }}
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://:9092,CONTROLLER://:9093"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "PLAINTEXT"
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data/logs"
+            - name: KAFKA_NUM_PARTITIONS
+              value: {{ .Values.numPartitions | quote }}
+            - name: KAFKA_DEFAULT_REPLICATION_FACTOR
+              value: {{ $rf | quote }}
+            - name: KAFKA_MIN_INSYNC_REPLICAS
+              value: {{ $minIsr | quote }}
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: {{ $rf | quote }}
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: {{ $rf | quote }}
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: {{ $minIsr | quote }}
+            - name: KAFKA_HEAP_OPTS
+              value: {{ .Values.heapOpts | quote }}
+          ports:
+            - name: client
+              containerPort: 9092
+            - name: controller
+              containerPort: 9093
+          readinessProbe:
+            tcpSocket:
+              port: client
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: controller
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

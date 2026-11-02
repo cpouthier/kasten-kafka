@@ -1,0 +1,6 @@
+apiVersion: v2
+name: kafka-kraft
+description: Apache Kafka in KRaft mode (combined broker + controller nodes) for Veeam Kasten blueprint testing
+type: application
+version: 1.0.0
+appVersion: "4.2.0"
